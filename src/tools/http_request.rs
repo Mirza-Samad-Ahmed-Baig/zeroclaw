@@ -527,34 +527,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validate_accepts_exact_host() {
-        let tool = test_tool(vec!["93.184.216.34"]);
+    async fn validate_accepts_exact_domain() {
+        let tool = test_tool(vec!["example.com"]);
         let got = tool
-            .validate_url("https://93.184.216.34/docs")
+            .validate_url("https://example.com/docs")
             .await
             .unwrap();
-        assert_eq!(got, "https://93.184.216.34/docs");
+        assert_eq!(got, "https://example.com/docs");
     }
 
     #[tokio::test]
     async fn validate_accepts_http() {
-        let tool = test_tool(vec!["93.184.216.34"]);
-        assert!(tool.validate_url("http://93.184.216.34").await.is_ok());
-    }
-
-    #[tokio::test]
-    async fn validate_accepts_wildcard_allowlist_for_public_host() {
-        let tool = test_tool(vec!["*"]);
-        assert!(tool
-            .validate_url("https://93.184.216.34")
-            .await
-            .is_ok());
+        let tool = test_tool(vec!["example.com"]);
+        assert!(tool.validate_url("http://example.com").await.is_ok());
     }
 
     #[test]
     fn host_matches_allowlist_accepts_subdomain() {
         let allowed = vec!["example.com".to_string()];
         assert!(host_matches_allowlist("api.example.com", &allowed));
+    }
+
+    #[tokio::test]
+    async fn validate_accepts_wildcard_allowlist_for_public_host() {
+        let tool = test_tool(vec!["*"]);
+        assert!(tool
+            .validate_url("https://news.ycombinator.com")
+            .await
+            .is_ok());
     }
 
     #[tokio::test]
@@ -572,7 +572,7 @@ mod tests {
     async fn validate_rejects_allowlist_miss() {
         let tool = test_tool(vec!["example.com"]);
         let err = tool
-            .validate_url("https://93.184.216.34")
+            .validate_url("https://google.com")
             .await
             .unwrap_err()
             .to_string();
