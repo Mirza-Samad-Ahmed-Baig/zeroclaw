@@ -29,7 +29,7 @@ impl HttpRequestTool {
         }
     }
 
-    fn validate_url(&self, raw_url: &str) -> anyhow::Result<String> {
+    async fn validate_url(&self, raw_url: &str) -> anyhow::Result<String> {
         let url = raw_url.trim();
 
         if url.is_empty() {
@@ -40,14 +40,26 @@ impl HttpRequestTool {
             anyhow::bail!("URL cannot contain whitespace");
         }
 
-        if !url.starts_with("http://") && !url.starts_with("https://") {
-            anyhow::bail!("Only http:// and https:// URLs are allowed");
-        }
-
         if self.allowed_domains.is_empty() {
             anyhow::bail!(
                 "HTTP request tool is enabled but no allowed_domains are configured. Add [http_request].allowed_domains in config.toml"
             );
+        }
+
+        let parsed = reqwest::Url::parse(url)
+            .map_err(|e| anyhow::anyhow!("Invalid URL: {e}"))?;
+
+        match parsed.scheme() {
+            "http" | "https" => {}
+            _ => anyhow::bail!("Only http:// and https:// URLs are allowed"),
+        }
+
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            anyhow::bail!("URL userinfo is not allowed");
+        }
+
+        if matches!(parsed.host(), Some(reqwest::url::Host::Ipv6(_))) {
+            anyhow::bail!("IPv6 hosts are not supported in http_request");
         }
 
         let host = extract_host(url)?;
@@ -60,7 +72,13 @@ impl HttpRequestTool {
             anyhow::bail!("Host '{host}' is not in http_request.allowed_domains");
         }
 
-        Ok(url.to_string())
+        let port = parsed
+            .port_or_known_default()
+            .unwrap_or_else(|| if parsed.scheme() == "https" { 443 } else { 80 });
+
+        ensure_host_resolves_to_public(&host, port).await?;
+
+        Ok(parsed.to_string())
     }
 
     fn validate_method(&self, method: &str) -> anyhow::Result<reqwest::Method> {
@@ -218,7 +236,7 @@ impl Tool for HttpRequestTool {
             });
         }
 
-        let url = match self.validate_url(url) {
+        let url = match self.validate_url(url).await {
             Ok(v) => v,
             Err(e) => {
                 return Ok(ToolResult {
@@ -389,6 +407,36 @@ fn host_matches_allowlist(host: &str, allowed_domains: &[String]) -> bool {
     })
 }
 
+async fn ensure_host_resolves_to_public(host: &str, port: u16) -> anyhow::Result<()> {
+    let addrs = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to resolve host '{host}': {e}"))?;
+    ensure_addrs_public(addrs)
+}
+
+fn ensure_addrs_public<I>(addrs: I) -> anyhow::Result<()>
+where
+    I: IntoIterator<Item = std::net::SocketAddr>,
+{
+    let mut saw_any = false;
+    for addr in addrs {
+        saw_any = true;
+        let is_non_global = match addr.ip() {
+            std::net::IpAddr::V4(v4) => is_non_global_v4(v4),
+            std::net::IpAddr::V6(v6) => is_non_global_v6(v6),
+        };
+        if is_non_global {
+            anyhow::bail!("Blocked local/private host: {}", addr.ip());
+        }
+    }
+
+    if !saw_any {
+        anyhow::bail!("DNS resolution returned no addresses");
+    }
+
+    Ok(())
+}
+
 fn is_private_or_local_host(host: &str) -> bool {
     // Strip brackets from IPv6 addresses like [::1]
     let bare = host
@@ -478,97 +526,110 @@ mod tests {
         assert_eq!(got, vec!["example.com".to_string()]);
     }
 
-    #[test]
-    fn validate_accepts_exact_domain() {
-        let tool = test_tool(vec!["example.com"]);
-        let got = tool.validate_url("https://example.com/docs").unwrap();
-        assert_eq!(got, "https://example.com/docs");
+    #[tokio::test]
+    async fn validate_accepts_exact_host() {
+        let tool = test_tool(vec!["93.184.216.34"]);
+        let got = tool
+            .validate_url("https://93.184.216.34/docs")
+            .await
+            .unwrap();
+        assert_eq!(got, "https://93.184.216.34/docs");
     }
 
-    #[test]
-    fn validate_accepts_http() {
-        let tool = test_tool(vec!["example.com"]);
-        assert!(tool.validate_url("http://example.com").is_ok());
+    #[tokio::test]
+    async fn validate_accepts_http() {
+        let tool = test_tool(vec!["93.184.216.34"]);
+        assert!(tool.validate_url("http://93.184.216.34").await.is_ok());
     }
 
-    #[test]
-    fn validate_accepts_subdomain() {
-        let tool = test_tool(vec!["example.com"]);
-        assert!(tool.validate_url("https://api.example.com/v1").is_ok());
-    }
-
-    #[test]
-    fn validate_accepts_wildcard_allowlist_for_public_host() {
+    #[tokio::test]
+    async fn validate_accepts_wildcard_allowlist_for_public_host() {
         let tool = test_tool(vec!["*"]);
-        assert!(tool.validate_url("https://news.ycombinator.com").is_ok());
+        assert!(tool
+            .validate_url("https://93.184.216.34")
+            .await
+            .is_ok());
     }
 
     #[test]
-    fn validate_wildcard_allowlist_still_rejects_private_host() {
+    fn host_matches_allowlist_accepts_subdomain() {
+        let allowed = vec!["example.com".to_string()];
+        assert!(host_matches_allowlist("api.example.com", &allowed));
+    }
+
+    #[tokio::test]
+    async fn validate_wildcard_allowlist_still_rejects_private_host() {
         let tool = test_tool(vec!["*"]);
         let err = tool
             .validate_url("https://localhost:8080")
+            .await
             .unwrap_err()
             .to_string();
         assert!(err.contains("local/private"));
     }
 
-    #[test]
-    fn validate_rejects_allowlist_miss() {
+    #[tokio::test]
+    async fn validate_rejects_allowlist_miss() {
         let tool = test_tool(vec!["example.com"]);
         let err = tool
-            .validate_url("https://google.com")
+            .validate_url("https://93.184.216.34")
+            .await
             .unwrap_err()
             .to_string();
         assert!(err.contains("allowed_domains"));
     }
 
-    #[test]
-    fn validate_rejects_localhost() {
+    #[tokio::test]
+    async fn validate_rejects_localhost() {
         let tool = test_tool(vec!["localhost"]);
         let err = tool
             .validate_url("https://localhost:8080")
+            .await
             .unwrap_err()
             .to_string();
         assert!(err.contains("local/private"));
     }
 
-    #[test]
-    fn validate_rejects_private_ipv4() {
+    #[tokio::test]
+    async fn validate_rejects_private_ipv4() {
         let tool = test_tool(vec!["192.168.1.5"]);
         let err = tool
             .validate_url("https://192.168.1.5")
+            .await
             .unwrap_err()
             .to_string();
         assert!(err.contains("local/private"));
     }
 
-    #[test]
-    fn validate_rejects_whitespace() {
+    #[tokio::test]
+    async fn validate_rejects_whitespace() {
         let tool = test_tool(vec!["example.com"]);
         let err = tool
             .validate_url("https://example.com/hello world")
+            .await
             .unwrap_err()
             .to_string();
         assert!(err.contains("whitespace"));
     }
 
-    #[test]
-    fn validate_rejects_userinfo() {
+    #[tokio::test]
+    async fn validate_rejects_userinfo() {
         let tool = test_tool(vec!["example.com"]);
         let err = tool
             .validate_url("https://user@example.com")
+            .await
             .unwrap_err()
             .to_string();
         assert!(err.contains("userinfo"));
     }
 
-    #[test]
-    fn validate_requires_allowlist() {
+    #[tokio::test]
+    async fn validate_requires_allowlist() {
         let security = Arc::new(SecurityPolicy::default());
         let tool = HttpRequestTool::new(security, vec![], 1_000_000, 30);
         let err = tool
             .validate_url("https://example.com")
+            .await
             .unwrap_err()
             .to_string();
         assert!(err.contains("allowed_domains"));
@@ -810,8 +871,8 @@ mod tests {
         assert!(!is_private_or_local_host("127.000.000.001"));
     }
 
-    #[test]
-    fn ssrf_alternate_notations_rejected_by_validate_url() {
+    #[tokio::test]
+    async fn ssrf_alternate_notations_rejected_by_validate_url() {
         // Even if is_private_or_local_host doesn't flag these, they
         // fail the allowlist because they're treated as hostnames.
         let tool = test_tool(vec!["example.com"]);
@@ -821,7 +882,11 @@ mod tests {
             "http://2130706433",
             "http://127.000.000.001",
         ] {
-            let err = tool.validate_url(notation).unwrap_err().to_string();
+            let err = tool
+                .validate_url(notation)
+                .await
+                .unwrap_err()
+                .to_string();
             assert!(
                 err.contains("allowed_domains"),
                 "Expected allowlist rejection for {notation}, got: {err}"
@@ -879,30 +944,51 @@ mod tests {
         assert!(is_private_or_local_host("::"));
     }
 
-    #[test]
-    fn validate_rejects_ftp_scheme() {
+    #[tokio::test]
+    async fn validate_rejects_ftp_scheme() {
         let tool = test_tool(vec!["example.com"]);
         let err = tool
             .validate_url("ftp://example.com")
+            .await
             .unwrap_err()
             .to_string();
         assert!(err.contains("http://") || err.contains("https://"));
     }
 
-    #[test]
-    fn validate_rejects_empty_url() {
+    #[tokio::test]
+    async fn validate_rejects_empty_url() {
         let tool = test_tool(vec!["example.com"]);
-        let err = tool.validate_url("").unwrap_err().to_string();
+        let err = tool.validate_url("").await.unwrap_err().to_string();
         assert!(err.contains("empty"));
     }
 
-    #[test]
-    fn validate_rejects_ipv6_host() {
+    #[tokio::test]
+    async fn validate_rejects_ipv6_host() {
         let tool = test_tool(vec!["example.com"]);
         let err = tool
             .validate_url("http://[::1]:8080/path")
+            .await
             .unwrap_err()
             .to_string();
         assert!(err.contains("IPv6"));
+    }
+
+    #[test]
+    fn dns_resolution_blocks_private_ip() {
+        let addrs = vec![std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+            443,
+        )];
+        let err = ensure_addrs_public(addrs).unwrap_err().to_string();
+        assert!(err.contains("local/private"));
+    }
+
+    #[test]
+    fn dns_resolution_allows_public_ip() {
+        let addrs = vec![std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 34)),
+            443,
+        )];
+        assert!(ensure_addrs_public(addrs).is_ok());
     }
 }
